@@ -24,9 +24,11 @@
 #define LOCAL_IP    "0.0.0.0"
 static int LOCAL_PORT; //本地端口，记得ufw或者服务商防火墙放开，我老是忘
 
-static char *REMOTE_IP;
+static const char *REMOTE_IP;
 static int REMOTE_TCP_PORT; //目标服务器TCP端口
 static int REMOTE_UDP_PORT; //目标服务器UDP端口
+static struct sockaddr_in remote_tcp_addr;
+static struct sockaddr_in remote_udp_addr;
 
 #define POOL_SIZE       24 //连接池大小
 #define REFILL_BATCH    8 //预链接池补充最大线程
@@ -37,6 +39,7 @@ static int REMOTE_UDP_PORT; //目标服务器UDP端口
 
 #define UDP_TABLE_SIZE      1024
 #define UDP_IDLE_TIMEOUT    60 //udp单端超时时长
+#define UDP_MAX_ASSOC       4096
 
 #define TAG_CONN_SIDE   ((uintptr_t)1)   //打tag
 #define TAG_UDP_ASSOC   ((uintptr_t)2)   
@@ -45,6 +48,7 @@ static int REMOTE_UDP_PORT; //目标服务器UDP端口
 
 static bool LOG_ENABLE = true;     //日志开关，懒，就做了一档
 #define LOG_RATE_PER_SEC 24        //每秒最多输出 24 条，多余排队
+#define LOG_QUEUE_MAX   4096       //日志队列硬上限，避免异常风暴时撑爆内存
 
 typedef struct LogNode {
     char *msg;
@@ -53,6 +57,8 @@ typedef struct LogNode {
 
 static pthread_mutex_t log_mtx = PTHREAD_MUTEX_INITIALIZER;
 static LogNode *log_head = NULL, *log_tail = NULL;
+static size_t log_queue_len = 0;
+static uint64_t log_drop_count = 0;
 
 static void log_enqueue_v(const char *fmt, va_list ap) {//产生日志
     if (!LOG_ENABLE) return;
@@ -73,8 +79,16 @@ static void log_enqueue_v(const char *fmt, va_list ap) {//产生日志
     node->next = NULL;
 
     pthread_mutex_lock(&log_mtx);
+    if (log_queue_len >= LOG_QUEUE_MAX) {
+        log_drop_count++;
+        pthread_mutex_unlock(&log_mtx);
+        free(node->msg);
+        free(node);
+        return;
+    }
     if (!log_tail) log_head = log_tail = node;
     else { log_tail->next = node; log_tail = node; }
+    log_queue_len++;
     pthread_mutex_unlock(&log_mtx);
 }
 
@@ -98,14 +112,32 @@ static void log_flush_rate_limited(uint64_t now_ms) {//日志限速
 
     while (quota > 0) {
         LogNode *node = NULL;
+        uint64_t dropped = 0;
 
         pthread_mutex_lock(&log_mtx);
-        if (log_head) {
+        if (log_drop_count > 0) {
+            dropped = log_drop_count;
+            log_drop_count = 0;
+        } else if (log_head) {
             node = log_head;
             log_head = log_head->next;
             if (!log_head) log_tail = NULL;
+            log_queue_len--;
         }
         pthread_mutex_unlock(&log_mtx);
+
+        if (dropped > 0) {
+            char msg[128];
+            int n = snprintf(msg, sizeof(msg),
+                             "Log queue overflow: dropped %llu messages",
+                             (unsigned long long)dropped);
+            if (n > 0) {
+                (void)write(STDOUT_FILENO, msg, (size_t)n);
+                (void)write(STDOUT_FILENO, "\n", 1);
+            }
+            quota--;
+            continue;
+        }
 
         if (!node) break;
 
@@ -121,14 +153,31 @@ static void log_flush_all_force(void) {
     if (!LOG_ENABLE) return;
     while (1) {
         LogNode *node = NULL;
+        uint64_t dropped = 0;
 
         pthread_mutex_lock(&log_mtx);
-        if (log_head) {
+        if (log_drop_count > 0) {
+            dropped = log_drop_count;
+            log_drop_count = 0;
+        } else if (log_head) {
             node = log_head;
             log_head = log_head->next;
             if (!log_head) log_tail = NULL;
+            log_queue_len--;
         }
         pthread_mutex_unlock(&log_mtx);
+
+        if (dropped > 0) {
+            char msg[128];
+            int n = snprintf(msg, sizeof(msg),
+                             "Log queue overflow: dropped %llu messages",
+                             (unsigned long long)dropped);
+            if (n > 0) {
+                (void)write(STDOUT_FILENO, msg, (size_t)n);
+                (void)write(STDOUT_FILENO, "\n", 1);
+            }
+            continue;
+        }
 
         if (!node) break;
 
@@ -154,6 +203,40 @@ static int set_nonblock(int fd) {//设置非阻塞
 
 static inline void safe_close(int *fd) {//安全关闭连接
     if (*fd >= 0) { close(*fd); *fd = -1; }
+}
+
+static bool parse_env_int(const char *name, int min, int max, int *out) {
+    const char *env = getenv(name);
+    if (!env || !*env) {
+        fprintf(stderr, "ERROR: %s not set\n", name);
+        return false;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (errno != 0 || end == NULL || *end != '\0' || v < min || v > max) {
+        fprintf(stderr, "ERROR: %s must be an integer in [%d, %d]\n", name, min, max);
+        return false;
+    }
+
+    *out = (int)v;
+    return true;
+}
+
+static bool parse_env_ipv4(const char *name, const char **out_str, struct in_addr *out_addr) {
+    const char *env = getenv(name);
+    if (!env || !*env) {
+        fprintf(stderr, "ERROR: %s not set\n", name);
+        return false;
+    }
+    if (inet_pton(AF_INET, env, out_addr) != 1) {
+        fprintf(stderr, "ERROR: %s must be a valid IPv4 address\n", name);
+        return false;
+    }
+
+    *out_str = env;
+    return true;
 }
 
 static void set_tcp_socket_options(int fd) {//TCP优化参数,缓冲区按照内核的来，不另外设置
@@ -228,12 +311,7 @@ static int pool_get_locked(void) {//取连接
 
 static void *thread_refill(void *arg) {//连接线程补充
     (void)arg;
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(REMOTE_TCP_PORT);
-    inet_pton(AF_INET, REMOTE_IP, &addr.sin_addr);
+    struct sockaddr_in addr = remote_tcp_addr;
 
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) goto fin;
@@ -319,12 +397,19 @@ static void *thread_maintain(void *arg) {//自动补充连接，以及连接每5
 }
 
 //TCP转发结构
+typedef enum {
+    CONN_CONNECTING = 0,
+    CONN_STREAMING = 1
+} conn_state_t;
+
 typedef struct Conn {
     int fd_l, fd_r; //客户端，远端
     int pipe_l2r[2], pipe_r2l[2];
     size_t len_l2r, len_r2l;//pipe中数据量
     uint64_t last_l2r, last_r2l;
+    uint64_t connect_start_ms;
     bool closed;
+    conn_state_t state;
     struct Conn *next;
 } Conn;
 
@@ -348,10 +433,15 @@ static void conn_watch(Conn *c) {
     uint32_t ev_l = EPOLLRDHUP | EPOLLET;
     uint32_t ev_r = EPOLLRDHUP | EPOLLET;
 
-    if (c->len_l2r < SPLICE_CHUNK) ev_l |= EPOLLIN;
-    if (c->len_r2l < SPLICE_CHUNK) ev_r |= EPOLLIN;
-    if (c->len_l2r > 0) ev_r |= EPOLLOUT;
-    if (c->len_r2l > 0) ev_l |= EPOLLOUT;
+    if (c->state == CONN_CONNECTING) {
+        if (c->len_l2r < SPLICE_CHUNK) ev_l |= EPOLLIN;
+        ev_r |= EPOLLOUT;
+    } else {
+        if (c->len_l2r < SPLICE_CHUNK) ev_l |= EPOLLIN;
+        if (c->len_r2l < SPLICE_CHUNK) ev_r |= EPOLLIN;
+        if (c->len_l2r > 0) ev_r |= EPOLLOUT;
+        if (c->len_r2l > 0) ev_l |= EPOLLOUT;
+    }
 
     struct epoll_event ev;
     ev.events = ev_l;
@@ -365,8 +455,8 @@ static void conn_watch(Conn *c) {
 
 typedef enum { PUMP_OK = 0, PUMP_EOF = 1, PUMP_ERR = 2 } pump_status_t;
 
-static pump_status_t pump(int src_fd, int dst_fd, int pipe_in, int pipe_out,//核心转发，零拷贝
-                          size_t *pipe_len, uint64_t now_ms, uint64_t *last_ts) {
+static pump_status_t pump_in(int src_fd, int pipe_in, size_t *pipe_len,
+                             uint64_t now_ms, uint64_t *last_ts) {
     while (*pipe_len < SPLICE_CHUNK) {
         ssize_t n = splice(src_fd, NULL, pipe_in, NULL,
                            (SPLICE_CHUNK - *pipe_len),
@@ -382,6 +472,31 @@ static pump_status_t pump(int src_fd, int dst_fd, int pipe_in, int pipe_out,//�
             return PUMP_ERR;
         }
     }
+
+    return PUMP_OK;
+}
+
+static pump_status_t pump_out(int pipe_out, int dst_fd, size_t *pipe_len,
+                              uint64_t now_ms, uint64_t *last_ts) {
+    while (*pipe_len > 0) {
+        ssize_t n = splice(pipe_out, NULL, dst_fd, NULL, *pipe_len,
+                           SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        if (n > 0) {
+            *pipe_len -= (size_t)n;
+            *last_ts = now_ms;
+        } else {
+            if (errno == EAGAIN) break;
+            return PUMP_ERR;
+        }
+    }
+
+    return PUMP_OK;
+}
+
+static pump_status_t pump_stream(int src_fd, int dst_fd, int pipe_in, int pipe_out,//核心转发，零拷贝
+                                 size_t *pipe_len, uint64_t now_ms, uint64_t *last_ts) {
+    pump_status_t st = pump_in(src_fd, pipe_in, pipe_len, now_ms, last_ts);
+    if (st != PUMP_OK) return st;
 
     while (*pipe_len > 0) {
         ssize_t n = splice(pipe_out, NULL, dst_fd, NULL, *pipe_len,
@@ -408,8 +523,9 @@ typedef struct UdpAssoc {
 } UdpAssoc;
 
 static UdpAssoc *udp_tab[UDP_TABLE_SIZE];
-static struct sockaddr_in remote_udp_addr;
 static int udp_listen_fd = -1;
+static size_t udp_assoc_count = 0;
+static uint64_t udp_limit_log_ms = 0;
 
 static inline uint32_t udp_hash(uint32_t ip_be, uint16_t port_be) {
     uint32_t ip = ntohl(ip_be);
@@ -429,6 +545,14 @@ static UdpAssoc* udp_get_or_create(const struct sockaddr_in *cli, uint64_t now_m
     while (p) {
         if (udp_addr_eq(&p->cli, cli)) { p->last_act = now_ms; return p; }
         p = p->next;
+    }
+
+    if (udp_assoc_count >= UDP_MAX_ASSOC) {
+        if (now_ms - udp_limit_log_ms >= 1000) {
+            log_enqueue("UDP association limit reached: %zu", udp_assoc_count);
+            udp_limit_log_ms = now_ms;
+        }
+        return NULL;
     }
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -451,6 +575,7 @@ static UdpAssoc* udp_get_or_create(const struct sockaddr_in *cli, uint64_t now_m
 
     n->next = udp_tab[idx];
     udp_tab[idx] = n;
+    udp_assoc_count++;
     return n;
 }
 
@@ -464,34 +589,44 @@ static void udp_remove(UdpAssoc *u, uint32_t idx, int epfd_) {
         if (*pp == u) { *pp = u->next; break; }
         pp = &(*pp)->next;
     }
+    if (udp_assoc_count > 0) udp_assoc_count--;
     free(u);
 }
 
+static bool conn_finish_connect(Conn *c) {
+    int err = 0;
+    socklen_t len = sizeof(err);
+
+    if (getsockopt(c->fd_r, SOL_SOCKET, SO_ERROR, &err, &len) != 0) return false;
+    if (err != 0) {
+        errno = err;
+        return false;
+    }
+
+    c->state = CONN_STREAMING;
+    c->connect_start_ms = 0;
+    return true;
+}
+
 int main() {
-    char *env;
-    env = getenv("LOCAL_PORT");
-    if (!env) {
-        fprintf(stderr, "ERROR: LOCAL_PORT not set\n");
+    struct in_addr remote_addr;
+    if (!parse_env_int("LOCAL_PORT", 1, 65535, &LOCAL_PORT) ||
+        !parse_env_ipv4("REMOTE_IP", &REMOTE_IP, &remote_addr) ||
+        !parse_env_int("REMOTE_TCP_PORT", 1, 65535, &REMOTE_TCP_PORT) ||
+        !parse_env_int("REMOTE_UDP_PORT", 1, 65535, &REMOTE_UDP_PORT)) {
         exit(1);
     }
-    LOCAL_PORT = atoi(env);
-    REMOTE_IP = getenv("REMOTE_IP");
-    if (!REMOTE_IP) {
-        fprintf(stderr, "ERROR: REMOTE_IP not set\n");
-        exit(1);
-    }
-    env = getenv("REMOTE_TCP_PORT");
-    if (!env) {
-        fprintf(stderr, "ERROR: REMOTE_TCP_PORT not set\n");
-        exit(1);
-    }
-    REMOTE_TCP_PORT = atoi(env);
-    env = getenv("REMOTE_UDP_PORT");
-    if (!env) {
-        fprintf(stderr, "ERROR: REMOTE_UDP_PORT not set\n");
-        exit(1);
-    }
-    REMOTE_UDP_PORT = atoi(env);
+
+    memset(&remote_tcp_addr, 0, sizeof(remote_tcp_addr));
+    remote_tcp_addr.sin_family = AF_INET;
+    remote_tcp_addr.sin_port = htons(REMOTE_TCP_PORT);
+    remote_tcp_addr.sin_addr = remote_addr;
+
+    memset(&remote_udp_addr, 0, sizeof(remote_udp_addr));
+    remote_udp_addr.sin_family = AF_INET;
+    remote_udp_addr.sin_port = htons(REMOTE_UDP_PORT);
+    remote_udp_addr.sin_addr = remote_addr;
+
     printf("Using config: %s:%d → %d/%d\n",
        REMOTE_IP, REMOTE_TCP_PORT, REMOTE_TCP_PORT, REMOTE_UDP_PORT);
     struct rlimit r = {65535, 65535};
@@ -544,11 +679,6 @@ int main() {
         return 1;
     }
 
-    memset(&remote_udp_addr, 0, sizeof(remote_udp_addr));
-    remote_udp_addr.sin_family = AF_INET;
-    remote_udp_addr.sin_port = htons(REMOTE_UDP_PORT);
-    inet_pton(AF_INET, REMOTE_IP, &remote_udp_addr.sin_addr);
-
     ev.events = EPOLLIN | EPOLLET;
     ev.data.ptr = TAG_UDP_LISTEN;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, udp_listen_fd, &ev) != 0) {
@@ -571,6 +701,7 @@ int main() {
             if (tagp == NULL) {
                 while (1) {
                     int cli = accept4(listen_fd, NULL, NULL, SOCK_NONBLOCK);
+                    bool rem_connecting = false;
                     if (cli < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         break;
@@ -584,27 +715,14 @@ int main() {
                     if (rem < 0) {//如果并发太高了，那么直接按照传统方式转发连接
                         log_enqueue("Exceeded Connections Pool, Direct Out...");
 
-                        struct sockaddr_in raddr;
-                        memset(&raddr, 0, sizeof(raddr));
-                        raddr.sin_family = AF_INET;
-                        raddr.sin_port = htons(REMOTE_TCP_PORT);
-                        inet_pton(AF_INET, REMOTE_IP, &raddr.sin_addr);
-
                         rem = socket(AF_INET, SOCK_STREAM, 0);
                         if (rem < 0) { close(cli); continue; }
                         set_tcp_socket_options(rem);
                         if (set_nonblock(rem) != 0) { close(rem); close(cli); continue; }
 
-                        int rc = connect(rem, (struct sockaddr*)&raddr, sizeof(raddr));
+                        int rc = connect(rem, (struct sockaddr*)&remote_tcp_addr, sizeof(remote_tcp_addr));
                         if (rc != 0 && errno != EINPROGRESS) { close(rem); close(cli); continue; }
-                        if (rc != 0) {
-                            struct pollfd pfd = { .fd = rem, .events = POLLOUT };
-                            if (poll(&pfd, 1, CONNECT_TIMEOUT * 1000) <= 0) { close(rem); close(cli); continue; }
-                            int err = 0;
-                            socklen_t len = sizeof(err);
-                            getsockopt(rem, SOL_SOCKET, SO_ERROR, &err, &len);
-                            if (err != 0) { close(rem); close(cli); continue; }
-                        }
+                        rem_connecting = (rc != 0);
                     }
 
                     Conn *c = (Conn*)calloc(1, sizeof(Conn));
@@ -615,6 +733,12 @@ int main() {
                     c->pipe_l2r[0] = c->pipe_l2r[1] = -1;
                     c->pipe_r2l[0] = c->pipe_r2l[1] = -1;
                     c->last_l2r = c->last_r2l = now;
+                    c->connect_start_ms = 0;
+                    c->state = CONN_STREAMING;
+                    if (rem_connecting) {
+                        c->state = CONN_CONNECTING;
+                        c->connect_start_ms = now;
+                    }
 
                     if (pipe2(c->pipe_l2r, O_NONBLOCK) != 0 || pipe2(c->pipe_r2l, O_NONBLOCK) != 0) {
                         conn_close(c);
@@ -702,13 +826,35 @@ int main() {
                 continue;
             }
 
-            pump_status_t st1 = pump(c->fd_l, c->fd_r, c->pipe_l2r[1], c->pipe_l2r[0],
-                                     &c->len_l2r, now, &c->last_l2r);
+            if (c->state == CONN_CONNECTING) {
+                if (is_remote_fd && (events[i].events & EPOLLOUT)) {
+                    if (!conn_finish_connect(c)) {
+                        log_enqueue("Direct Connect Failed: %s", strerror(errno));
+                        conn_close(c);
+                        continue;
+                    }
+                }
+
+                pump_status_t st_wait = pump_in(c->fd_l, c->pipe_l2r[1], &c->len_l2r, now, &c->last_l2r);
+                if (st_wait == PUMP_EOF) { log_enqueue("Connection Closed: Local->Remote"); conn_close(c); continue; }
+                if (st_wait == PUMP_ERR) { log_enqueue("Connection Closed Accidentally: Local->Remote"); conn_close(c); continue; }
+
+                if (c->state == CONN_STREAMING && c->len_l2r > 0) {
+                    pump_status_t st_flush = pump_out(c->pipe_l2r[0], c->fd_r, &c->len_l2r, now, &c->last_l2r);
+                    if (st_flush == PUMP_ERR) { log_enqueue("Connection Closed Accidentally: Local->Remote"); conn_close(c); continue; }
+                }
+
+                conn_watch(c);
+                continue;
+            }
+
+            pump_status_t st1 = pump_stream(c->fd_l, c->fd_r, c->pipe_l2r[1], c->pipe_l2r[0],
+                                            &c->len_l2r, now, &c->last_l2r);
             if (st1 == PUMP_EOF) { log_enqueue("Connection Closed: Local->Remote"); conn_close(c); continue; }
             if (st1 == PUMP_ERR) { log_enqueue("Connection Closed Accidentally: Local->Remote"); conn_close(c); continue; }
 
-            pump_status_t st2 = pump(c->fd_r, c->fd_l, c->pipe_r2l[1], c->pipe_r2l[0],
-                                     &c->len_r2l, now, &c->last_r2l);
+            pump_status_t st2 = pump_stream(c->fd_r, c->fd_l, c->pipe_r2l[1], c->pipe_r2l[0],
+                                            &c->len_r2l, now, &c->last_r2l);
             if (st2 == PUMP_EOF) { log_enqueue("Connection Closed: Remote->Local"); conn_close(c); continue; }
             if (st2 == PUMP_ERR) { log_enqueue("Connection Closed Accidentally: Remote->Local"); conn_close(c); continue; }
 
@@ -725,12 +871,21 @@ int main() {
                 Conn *next = cur->next;
 
                 uint64_t last_any = (cur->last_l2r > cur->last_r2l) ? cur->last_l2r : cur->last_r2l;
-                bool timeout = (now - last_any > (uint64_t)IDLE_TIMEOUT * 1000ULL);
+                bool timeout = false;
+                if (cur->state == CONN_CONNECTING) {
+                    timeout = (now - cur->connect_start_ms > (uint64_t)CONNECT_TIMEOUT * 1000ULL);
+                } else {
+                    timeout = (now - last_any > (uint64_t)IDLE_TIMEOUT * 1000ULL);
+                }
 
                 if (cur->closed || timeout) {
                     if (timeout && !cur->closed) {
-                        log_enqueue("Timeout(%ds): Local->Remote", IDLE_TIMEOUT);
-                        log_enqueue("Timeout(%ds): Remote->Local", IDLE_TIMEOUT);
+                        if (cur->state == CONN_CONNECTING) {
+                            log_enqueue("Direct Connect Timeout(%ds)", CONNECT_TIMEOUT);
+                        } else {
+                            log_enqueue("Timeout(%ds): Local->Remote", IDLE_TIMEOUT);
+                            log_enqueue("Timeout(%ds): Remote->Local", IDLE_TIMEOUT);
+                        }
                         conn_close(cur);
                     } else if (!cur->closed) {
                         conn_close(cur);
