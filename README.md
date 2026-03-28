@@ -115,18 +115,20 @@ REMOTE_IP:REMOTE_TCP_PORT
 ---
 
 ## 效果示例
-无预链接的转发（使用realm）：
+
+* 无预链接的转发（使用realm）：
 <img width="2337" height="277" alt="image" src="https://github.com/user-attachments/assets/cba16059-ded2-43da-b571-0bcaff2ea70b" />
-有预链接的转发:
+
+* 有预链接的转发:
 <img width="2559" height="256" alt="image" src="https://github.com/user-attachments/assets/bc78e370-9072-4fb1-90fc-75d2a6304618" />
-单线程测速：（需要调参）
+* 单线程测速：（需要调参）
 <img width="2557" height="216" alt="image" src="https://github.com/user-attachments/assets/30c7c92e-c9d1-4f9d-80ee-9b41190a9d8f" />
-gomami最近被干了禁用了udp，实际上没问题，等好了我更新一下图片。
+* gomami最近被干了禁用了udp，实际上没问题，等好了我更新一下图片。
 
-测试环境为上海移动，日本优化线路为gomami，美国西雅图落地为Bug Net（名字懒得改了），可见在转发路径高rtt情况下有明显的延时下降，同时单线程速率表现良好，和其它转发无异。
+* 测试环境为上海移动，日本优化线路为gomami，美国西雅图落地为Bug Net（名字懒得改了），可见在转发路径高rtt情况下有明显的延时下降，同时单线程速率表现良好，和其它转发无异。
 
-日本优化Gomami：https://www.gomami.io (贵，无aff）
-美国西雅图落地：https://www.misaka.io (贵，无aff，商家也没开aff功能）
-美国西雅图落地：https://bug.pw （便宜点，日本过去延时稳定82ms，带宽现在比misaka足且稳定，所以有aff）
+* 日本优化Gomami：https://www.gomami.io (贵，无aff）
+* 美国西雅图落地：https://www.misaka.io (贵，无aff，商家也没开aff功能）
+* 美国西雅图落地：https://bug.pw （便宜点，日本过去延时稳定82ms，带宽现在比misaka足且稳定，所以有aff）
 
 
