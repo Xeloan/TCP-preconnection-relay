@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-echo "Installing TCP-preconnection-relay..."
+echo "Installing TCP-preconnection-relay v1.2..."
 apt update
 apt install -y nano
 apt install -y build-essential
