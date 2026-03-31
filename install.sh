@@ -178,13 +178,13 @@ while IFS= read -r raw || [ -n "$raw" ]; do
         exit 1
     fi
 
-    if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+        key="${BASH_REMATCH[1]}"
+        val="$(trim "${BASH_REMATCH[2]}")"
+    else
         echo "标签不合法，参考python变量名 [$current]: $line" >&2
         exit 1
     fi
-
-    key="${BASH_REMATCH[1]}"
-    val="$(trim "${BASH_REMATCH[2]}")"
 
     case "$key" in
         LOCAL_IP|LOCAL_PORT|REMOTE_IP|REMOTE_TCP_PORT|REMOTE_UDP_PORT)
