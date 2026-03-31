@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 //配置
-static char *LOCAL_IP;   // 你配置读取后赋值
+static char *LOCAL_IP;
 static struct sockaddr_storage local_bind_addr;
 static socklen_t local_bind_addrlen;
 static struct sockaddr_storage remote_tcp_addr;
