@@ -2,6 +2,7 @@
 set -e
 
 echo "正在安装 TCP-preconnection-relay v1.3..."
+echo "如果报错有个括号啥的，请重新到github上复制脚本链接，有变动"
 
 apt update
 apt install -y nano curl build-essential
@@ -35,7 +36,7 @@ cleanup_old_tcp_pool() {
     systemctl daemon-reload || true
 }
 
-read -r -p "你是否要清空旧版配置？前一版本的用户必须清空，因为配置大改了。 [y/N]: " CLEAR_OLD
+read -r -p "你是否要清空旧版配置？如果是v1.3之前版本的必须清空，因为配置大改了。 [y/N]: " CLEAR_OLD
 case "$CLEAR_OLD" in
     y|Y)
         cleanup_old_tcp_pool
