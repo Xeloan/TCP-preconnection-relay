@@ -700,6 +700,7 @@ int main() {
                     c->pipe_l2r[0] = c->pipe_l2r[1] = -1;
                     c->pipe_r2l[0] = c->pipe_r2l[1] = -1;
                     c->last_l2r = c->last_r2l = now;
+                    c->half_close_since = 0;
 
                     if (pipe2(c->pipe_l2r, O_NONBLOCK) != 0 || pipe2(c->pipe_r2l, O_NONBLOCK) != 0) {
                         conn_close(c);
@@ -828,6 +829,7 @@ int main() {
                 if (st1 == PUMP_EOF) {
                     c->eof_l2r = true;
                     if (!c->eof_r2l && c->half_close_since == 0) c->half_close_since = now;
+                    else if (c->eof_r2l) c->half_close_since = 0;
                     log_enqueue("EOF: Local->Remote");
                 }
             } else if (c->len_l2r > 0) {
@@ -862,6 +864,7 @@ int main() {
                 if (st2 == PUMP_EOF) {
                     c->eof_r2l = true;
                     if (!c->eof_l2r && c->half_close_since == 0) c->half_close_since = now;
+                    else if (c->eof_l2r) c->half_close_since = 0;
                     log_enqueue("EOF: Remote->Local");
                 }
             } else if (c->len_r2l > 0) {
