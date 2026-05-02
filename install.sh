@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "正在安装 TCP-preconnection-relay v1.5..."
+echo "正在安装 TCP-preconnection-relay v1.6..."
 echo "如果报错有个括号啥的，请重新到github上复制脚本链接，有变动"
 
 apt update
