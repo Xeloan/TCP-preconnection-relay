@@ -38,6 +38,7 @@ static int REMOTE_UDP_PORT; //目标服务器UDP端口
 #define REFILL_BATCH    8 //预链接池补充最大线程
 #define CONNECT_TIMEOUT 5
 #define IDLE_TIMEOUT    240 //空闲tcp(被使用过后的)回收时长
+#define HALF_CLOSE_TIMEOUT 10 //半关闭态最多保留10秒
 
 #define SPLICE_CHUNK (64 * 1024) //单次数据搬运量
 
@@ -359,6 +360,7 @@ typedef struct Conn {
     bool eof_r2l;             //remote->local方向收到EOF
     bool shut_wr_r;           //已对fd_r调用shutdown(SHUT_WR)
     bool shut_wr_l;           //已对fd_l调用shutdown(SHUT_WR)
+    uint64_t half_close_since;//进入半关闭态的时间
 } Conn;
 
 static int epfd;
@@ -698,6 +700,7 @@ int main() {
                     c->pipe_l2r[0] = c->pipe_l2r[1] = -1;
                     c->pipe_r2l[0] = c->pipe_r2l[1] = -1;
                     c->last_l2r = c->last_r2l = now;
+                    c->half_close_since = 0;
 
                     if (pipe2(c->pipe_l2r, O_NONBLOCK) != 0 || pipe2(c->pipe_r2l, O_NONBLOCK) != 0) {
                         conn_close(c);
@@ -825,6 +828,8 @@ int main() {
                 }
                 if (st1 == PUMP_EOF) {
                     c->eof_l2r = true;
+                    if (!c->eof_r2l && c->half_close_since == 0) c->half_close_since = now;
+                    else if (c->eof_r2l) c->half_close_since = 0;
                     log_enqueue("EOF: Local->Remote");
                 }
             } else if (c->len_l2r > 0) {
@@ -858,6 +863,8 @@ int main() {
                 }
                 if (st2 == PUMP_EOF) {
                     c->eof_r2l = true;
+                    if (!c->eof_l2r && c->half_close_since == 0) c->half_close_since = now;
+                    else if (c->eof_l2r) c->half_close_since = 0;
                     log_enqueue("EOF: Remote->Local");
                 }
             } else if (c->len_r2l > 0) {
@@ -902,13 +909,19 @@ int main() {
                 uint64_t last_any = (cur->last_l2r > cur->last_r2l) ? cur->last_l2r : cur->last_r2l;
                 bool timeout = (!cur->connecting) &&
                             (now - last_any > (uint64_t)IDLE_TIMEOUT * 1000ULL);
+                bool half_close_timeout = (cur->eof_l2r != cur->eof_r2l) &&
+                            cur->half_close_since > 0 &&
+                            (now - cur->half_close_since > (uint64_t)HALF_CLOSE_TIMEOUT * 1000ULL);
                 if (cur->connecting &&
                     now - cur->connect_start > (uint64_t)CONNECT_TIMEOUT * 1000ULL) {
                     log_enqueue("Connect timeout");
                     conn_close(cur);
                 }
-                if (cur->closed || timeout) {
-                    if (timeout && !cur->closed) {
+                if (cur->closed || timeout || half_close_timeout) {
+                    if (half_close_timeout && !cur->closed) {
+                        log_enqueue("Half-close timeout(%ds)", HALF_CLOSE_TIMEOUT);
+                        conn_close(cur);
+                    } else if (timeout && !cur->closed) {
                         log_enqueue("Timeout(%ds): Local->Remote", IDLE_TIMEOUT);
                         log_enqueue("Timeout(%ds): Remote->Local", IDLE_TIMEOUT);
                         conn_close(cur);
