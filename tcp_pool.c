@@ -527,6 +527,8 @@ typedef struct Conn {
     bool shut_wr_r;           //已对fd_r调用shutdown(SHUT_WR)
     bool shut_wr_l;           //已对fd_l调用shutdown(SHUT_WR)
     uint64_t half_close_since;//进入半关闭态的时间
+    uint32_t events_l, events_r; //已注册的epoll事件，避免无条件MOD重新触发
+    bool repoll_l, repoll_r;     //本轮达到搬运预算，需要继续处理可读数据
 } Conn;
 
 static int epfd;
@@ -549,64 +551,75 @@ static void conn_watch(Conn *c) {
     uint32_t ev_l = EPOLLET;
     uint32_t ev_r = EPOLLET;
 
-    //只在未收到EOF的方向上监听EPOLLRDHUP
-    if (!c->eof_l2r) {
-        ev_l |= EPOLLRDHUP;
-        if (c->len_l2r < cfg_splice_chunk) ev_l |= EPOLLIN;
+    if (c->connecting) {
+        ev_r |= EPOLLOUT | EPOLLRDHUP;
+    } else {
+        //有积压时只等待目标可写。实际pipe容量可能远小于cfg_splice_chunk，
+        //而且splice可能耗尽pipe buffer槽位，不能用字节数推断剩余容量。
+        if (!c->eof_l2r && c->len_l2r == 0) ev_l |= EPOLLIN | EPOLLRDHUP;
+        if (!c->eof_r2l && c->len_r2l == 0) ev_r |= EPOLLIN | EPOLLRDHUP;
+        if (c->len_l2r > 0) ev_r |= EPOLLOUT;
+        if (c->len_r2l > 0) ev_l |= EPOLLOUT;
     }
-    if (!c->eof_r2l) {
-        ev_r |= EPOLLRDHUP;
-        if (c->len_r2l < cfg_splice_chunk) ev_r |= EPOLLIN;
-    }
-    if (c->len_l2r > 0) ev_r |= EPOLLOUT;
-    if (c->len_r2l > 0) ev_l |= EPOLLOUT;
 
     struct epoll_event ev;
-    ev.events = ev_l;
-    ev.data.ptr = (void*)((uintptr_t)c | (uintptr_t)0);
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd_l, &ev) != 0) { conn_close(c); return; }
-
-    ev.events = ev_r;
-    ev.data.ptr = (void*)((uintptr_t)c | TAG_CONN_SIDE);
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd_r, &ev) != 0) { conn_close(c); return; }
+    //MOD会重新检查就绪状态，即使使用EPOLLET也不能每轮无条件调用。
+    //只有事件集合变化，或本轮确实搬运到预算上限时，才重新注册。
+    if (ev_l != c->events_l || c->repoll_l) {
+        ev.events = ev_l;
+        ev.data.ptr = (void*)((uintptr_t)c | (uintptr_t)0);
+        int op = c->events_l ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+        if (epoll_ctl(epfd, op, c->fd_l, &ev) != 0) { conn_close(c); return; }
+        c->events_l = ev_l;
+    }
+    if (ev_r != c->events_r || c->repoll_r) {
+        ev.events = ev_r;
+        ev.data.ptr = (void*)((uintptr_t)c | TAG_CONN_SIDE);
+        int op = c->events_r ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+        if (epoll_ctl(epfd, op, c->fd_r, &ev) != 0) { conn_close(c); return; }
+        c->events_r = ev_r;
+    }
+    c->repoll_l = c->repoll_r = false;
 }
 
-typedef enum { PUMP_OK = 0, PUMP_EOF = 1, PUMP_ERR = 2 } pump_status_t;
+typedef enum { PUMP_OK = 0, PUMP_EOF = 1, PUMP_ERR = 2, PUMP_MORE = 3 } pump_status_t;
 
-static pump_status_t pump(int src_fd, int dst_fd, int pipe_in, int pipe_out,//核心转发，零拷贝
+static pump_status_t pump(int src_fd, int dst_fd, int pipe_in, int pipe_out,
                           size_t *pipe_len, uint64_t now_ms, uint64_t *last_ts) {
-    bool got_eof = false;
+    size_t moved = 0;
 
-    while (*pipe_len < cfg_splice_chunk) {
-        ssize_t n = splice(src_fd, NULL, pipe_in, NULL,
-                           (cfg_splice_chunk - *pipe_len),
+    for (;;) {
+        //先排空pipe，再读取源端。遇到下游背压立即等待EPOLLOUT。
+        while (*pipe_len > 0) {
+            ssize_t n = splice(pipe_out, NULL, dst_fd, NULL, *pipe_len,
+                               SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+            if (n > 0) {
+                *pipe_len -= (size_t)n;
+                *last_ts = now_ms;
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return PUMP_OK;
+            return PUMP_ERR;
+        }
+
+        //限制单次处理量，避免高速连接独占事件线程；显式重新触发可读端，
+        //不能依赖无条件MOD，否则修复空转后可能遗漏尚未读完的ET事件。
+        if (moved >= cfg_splice_chunk) return PUMP_MORE;
+
+        ssize_t n = splice(src_fd, NULL, pipe_in, NULL, cfg_splice_chunk - moved,
                            SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (n > 0) {
             *pipe_len += (size_t)n;
+            moved += (size_t)n;
             *last_ts = now_ms;
-            if (*pipe_len >= cfg_splice_chunk) break;
-        } else if (n == 0) {
-            got_eof = true;
-            break;  //收到EOF，但先不返回，继续把pipe里的数据刷到目标
-        } else {
-            if (errno == EAGAIN) break;
-            return PUMP_ERR;
+            continue;
         }
+        if (n == 0) return PUMP_EOF;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return PUMP_OK;
+        return PUMP_ERR;
     }
-
-    while (*pipe_len > 0) {
-        ssize_t n = splice(pipe_out, NULL, dst_fd, NULL, *pipe_len,
-                           SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
-        if (n > 0) {
-            *pipe_len -= (size_t)n;
-            *last_ts = now_ms;
-        } else {
-            if (errno == EAGAIN) break;
-            return PUMP_ERR;
-        }
-    }
-
-    return got_eof ? PUMP_EOF : PUMP_OK;
 }
 
 //UDP转发，每客户端一个socket
@@ -818,6 +831,11 @@ int main() {
 
     while (1) {
         int nfds = epoll_wait(epfd, events, EPOLL_EVENTS_MAX, 100);
+        if (nfds < 0) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait");
+            return 1;
+        }
         uint64_t now = mono_ms();
         log_flush_rate_limited(now);
 
@@ -878,26 +896,8 @@ int main() {
                     grow_pipe_capacity(c->pipe_l2r);
                     grow_pipe_capacity(c->pipe_r2l);
 
-                    struct epoll_event ev_c;
-
-                    uint32_t ev_l = EPOLLRDHUP | EPOLLET;
-                    if (!c->connecting) ev_l |= EPOLLIN;
-
-                    ev_c.events = ev_l;
-                    ev_c.data.ptr = (void*)((uintptr_t)c | (uintptr_t)0);
-                    if (epoll_ctl(epfd, EPOLL_CTL_ADD, cli, &ev_c) != 0) {
-                        conn_close(c);
-                        free(c);
-                        continue;
-                    }
-                    uint32_t ev_r = EPOLLRDHUP | EPOLLET;
-                    if (c->connecting) ev_r |= EPOLLOUT;
-                    else ev_r |= EPOLLIN;
-
-                    ev_c.events = ev_r;
-                    ev_c.data.ptr = (void*)((uintptr_t)c | TAG_CONN_SIDE);
-                    if (epoll_ctl(epfd, EPOLL_CTL_ADD, rem, &ev_c) != 0) {
-                        conn_close(c);
+                    conn_watch(c);
+                    if (c->closed) {
                         free(c);
                         continue;
                     }
@@ -962,9 +962,9 @@ int main() {
                 if (events[i].events & (EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {//这里保险还是判断完整一点
                     int err = 0;
                     socklen_t len = sizeof(err);
-                    getsockopt(c->fd_r, SOL_SOCKET, SO_ERROR, &err, &len);
+                    int rc = getsockopt(c->fd_r, SOL_SOCKET, SO_ERROR, &err, &len);
 
-                    if (err != 0) {
+                    if (rc != 0 || err != 0) {
                         log_enqueue("Connect failed");
                         conn_close(c);
                         continue;
@@ -984,6 +984,7 @@ int main() {
                 conn_close(c);
                 continue;
             }
+            if (c->connecting) continue; //连接成功之前不向远端搬运数据
             //EPOLLRDHUP/EPOLLHUP不再立即关闭，留给pump处理EOF和半关闭
 
             pump_status_t st1 = PUMP_OK, st2 = PUMP_OK;
@@ -1064,6 +1065,8 @@ int main() {
                 continue;
             }
 
+            c->repoll_l = (st1 == PUMP_MORE);
+            c->repoll_r = (st2 == PUMP_MORE);
             conn_watch(c);
         }
 

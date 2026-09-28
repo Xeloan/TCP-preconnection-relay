@@ -1,0 +1,21 @@
+name: Forwarding regression tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build relay
+        run: gcc -O2 -pthread -Wall -Wextra -Wshadow -Wformat=2 -o /tmp/tcp_pool tcp_pool.c
+      - name: Fault injection with sanitizers
+        run: python3 tests/test_forwarding.py
+      - name: Real TCP backpressure and half-close tests
+        run: python3 tests/test_linux.py
